@@ -4,7 +4,7 @@ const app = new Hono();
 
 // Serve HTML
 app.get('/', async (c) => {
-	const html = await fetch('https://your-domain.com/index.html').then(r => r.text());
+	const html = await fetch('https://enwek.com/post/insrtli.html').then(r => r.text());
 	return c.html(html);
 });
 
