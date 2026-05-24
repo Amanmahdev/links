@@ -1,0 +1,28 @@
+name       = "enwek-worker"
+main       = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# ── D1 Databases ─────────────────────────────────────────────
+# Create them first:
+#   wrangler d1 create enwek-users
+#   wrangler d1 create enwek-links
+# Then paste the generated database_id values below.
+
+[[d1_databases]]
+binding      = "USERS_DB"
+database_name = "users"
+database_id  = "47e66cc6-ceba-4d7f-a07e-7455123e4db1"
+
+[[d1_databases]]
+binding      = "LINKS_DB"
+database_name = "links"
+database_id  = "1a8e562a-a89f-47db-92c5-08f088b66c97"
+
+# ── Secrets (set via wrangler secret put) ────────────────────
+# ADMIN_SECRET  — required for bulk upload endpoint
+# Set with:  wrangler secret put ADMIN_SECRET
+
+# ── Environment variables ────────────────────────────────────
+[vars]
+ENVIRONMENT = "production"
+ALLOWED_ORIGIN = "https://enwek.com"

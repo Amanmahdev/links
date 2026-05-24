@@ -1,6 +1,7 @@
-# enwek-worker
+# Enwek Worker — links.enwek.com
 
-Cloudflare Worker (Hono + D1) that handles the **links insertion** and **random fetch** pipeline for Enwek.
+Cloudflare Worker powering the Enwek link platform.
+Built with **Hono** + **Cloudflare D1 (SQLite)**.
 
 ---
 
@@ -9,125 +10,170 @@ Cloudflare Worker (Hono + D1) that handles the **links insertion** and **random 
 ```
 enwek-worker/
 ├── src/
-│   └── index.ts          ← Hono worker — all API routes
-├── public/
-│   ├── upload.html       ← Admin panel: single & bulk link upload
-│   └── fetch.html        ← Discovery page: random links with filters
-├── wrangler.toml
-├── package.json
-└── tsconfig.json
+│   ├── index.js              ← entry point, CORS, all routes mounted
+│   ├── routes/
+│   │   ├── links.js          ← GET random, GET feed, POST single, POST bulk
+│   │   ├── categories.js     ← GET /api/categories
+│   │   ├── metadata.js       ← GET /api/metadata?url=…
+│   │   ├── comments.js       ← GET + POST /api/comments/:linkId
+│   │   ├── auth.js           ← register, login, logout, me
+│   │   └── scores.js         ← POST /api/internal/refresh-scores
+│   └── lib/
+│       ├── nanoid.js         ← ID generator (Web Crypto, no Node)
+│       ├── hash.js           ← SHA-256 URL hash, domain extractor, hot score
+│       └── metadata.js       ← OG/meta tag scraper
+├── schema.sql                ← full D1 schema (apply once per database)
+├── wrangler.toml             ← Cloudflare config
+└── package.json
 ```
 
 ---
 
-## Quick start
+## First-time setup
 
-### 1 — Install dependencies
+### 1. Install dependencies
 ```bash
 npm install
 ```
 
-### 2 — Create the D1 database
+### 2. Create both D1 databases
 ```bash
-npx wrangler d1 create enwek-db
-# Copy the database_id printed to stdout
+wrangler d1 create enwek-users
+wrangler d1 create enwek-links
 ```
 
-Paste the `database_id` into `wrangler.toml`:
+Copy the `database_id` values printed by each command into `wrangler.toml`:
 ```toml
 [[d1_databases]]
-binding = "DB"
-database_name = "enwek-db"
-database_id = "PASTE_ID_HERE"
+binding       = "USERS_DB"
+database_name = "enwek-users"
+database_id   = "PASTE_USERS_ID_HERE"
+
+[[d1_databases]]
+binding       = "LINKS_DB"
+database_name = "enwek-links"
+database_id   = "PASTE_LINKS_ID_HERE"
 ```
 
-### 3 — Apply the schema
+### 3. Apply the schema
+
+The schema file covers both logical databases (users tables and links tables
+are all in `schema.sql`). Apply it to **both** databases — D1 uses
+`IF NOT EXISTS` so tables that don't apply to a DB simply won't be created
+(they'll error silently and skip). Alternatively keep two separate schema
+files for strict separation.
+
 ```bash
-npx wrangler d1 execute enwek-db --file=../enwek_schema.sql
+# Apply to users DB (creates accounts, sessions, subscriptions, follows, notifications, password_resets)
+wrangler d1 execute enwek-users --file=schema.sql
+
+# Apply to links DB (creates links, categories, likes, saves, clicks, comments, comment_likes, reports, tags)
+wrangler d1 execute enwek-links --file=schema.sql
 ```
 
-### 4 — Set secrets
-In `wrangler.toml` set your `ADMIN_SECRET` (used to protect `/api/links/bulk`).  
-For production, use Wrangler secrets instead:
+### 4. Set the admin secret
 ```bash
-npx wrangler secret put ADMIN_SECRET
+wrangler secret put ADMIN_SECRET
+# Type a strong random string when prompted
+# This is required for /api/links/bulk and /api/internal/refresh-scores
 ```
 
-### 5 — Dev server
+### 5. Run locally
 ```bash
 npm run dev
-# → http://localhost:8787
+# Worker available at http://localhost:8787
 ```
-Then open:
-- `http://localhost:8787/upload.html` — upload panel
-- `http://localhost:8787/fetch.html`  — discovery page
 
-### 6 — Deploy
+### 6. Deploy
 ```bash
 npm run deploy
+# Deploys to links.enwek.com (set up a Custom Domain in the CF dashboard)
 ```
 
 ---
 
 ## API reference
 
-| Method | Route | Auth | Description |
-|--------|-------|------|-------------|
-| `GET` | `/api/metadata?url=<url>` | — | Scrape OG/meta tags from a URL |
-| `GET` | `/api/categories` | — | List all categories |
-| `POST` | `/api/links` | — | Insert a single link |
-| `POST` | `/api/links/bulk` | `X-Admin-Secret` header | Insert up to 500 links |
-| `GET` | `/api/links/random` | — | Fetch N random active links |
-| `GET` | `/api/links/random?category=slug` | — | Random within a category |
-| `GET` | `/api/links/random?format=video` | — | Random by format |
-| `GET` | `/api/links/:id` | — | Get a link by ID |
+All endpoints are at `https://links.enwek.com`.
 
-### POST /api/links — body
+### fetch.html endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/categories` | All categories (for filter pills) |
+| `GET` | `/api/links/random?count=12&category=tech&format=video` | Random link batch |
+
+### upload.html endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/categories` | Categories for dropdown |
+| `GET` | `/api/metadata?url=https://…` | Auto-fetch OG title/description/thumbnail |
+| `POST` | `/api/links` | Insert single link |
+| `POST` | `/api/links/bulk` | Insert up to 100 links (requires `X-Admin-Secret`) |
+
+### Other endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/links?sort=hot&page=1` | Paginated feed |
+| `GET` | `/api/links/:id` | Single link |
+| `POST` | `/api/links/:id/click` | Record click |
+| `POST` | `/api/links/:id/like` | Toggle like |
+| `POST` | `/api/links/:id/save` | Toggle save |
+| `GET` | `/api/comments/:linkId` | Link comments |
+| `POST` | `/api/comments/:linkId` | Post comment |
+| `POST` | `/api/auth/register` | Create account |
+| `POST` | `/api/auth/login` | Log in |
+| `POST` | `/api/auth/logout` | Log out |
+| `GET` | `/api/auth/me` | Current user (Bearer token) |
+| `POST` | `/api/internal/refresh-scores` | Recalculate hot scores (X-Internal-Secret) |
+| `GET` | `/health` | Uptime check |
+
+### Single link insert body
 ```json
 {
-  "url": "https://example.com/article",
+  "url":         "https://example.com/article",
   "category_id": "cat_tech",
-  "title": "optional — auto-fetched if blank",
-  "description": "optional",
-  "thumbnail": "optional",
-  "submitted_by": "user_nanoid (optional)"
+  "title":       "Optional — auto-fetched if empty",
+  "description": "Optional",
+  "thumbnail":   "Optional image URL",
+  "format":      "page"
 }
 ```
 
-### POST /api/links/bulk — body
+### Bulk insert body
 ```json
 {
   "links": [
-    { "url": "https://..." },
-    { "url": "https://...", "category_id": "cat_sci" }
+    { "url": "https://example.com/1", "category_id": "cat_tech" },
+    { "url": "https://example.com/2", "category_id": "cat_sci"  }
   ]
 }
 ```
-Header: `X-Admin-Secret: <your secret>`
-
-### GET /api/links/random — query params
-| param | default | description |
-|-------|---------|-------------|
-| `count` | `1` | Number of links (max 50) |
-| `category` | — | Category slug (e.g. `tech`) |
-| `format` | — | `page` \| `video` \| `pdf` \| `software` |
+Header required: `X-Admin-Secret: your-secret`
 
 ---
 
-## upload.html
+## Enabling the hourly cron (hot score refresh)
 
-- **Single mode** — paste one URL, see a live metadata preview, pick a category, click Insert.
-- **Bulk mode** — paste up to 500 URLs (one per line), pick a category, click Upload.  
-  Metadata is fetched automatically per URL.  
-  Requires the Admin Secret.
-- Session stats panel shows inserted / duplicate / error counts.
-- Live log panel with per-URL status.
+Add to `wrangler.toml`:
+```toml
+[triggers]
+crons = ["0 * * * *"]
+```
 
-## fetch.html
+The `scheduled` handler in `src/index.js` runs automatically every hour,
+recalculating hot scores only for links active in the last 24 hours.
 
-- Loads a random batch of links from the DB on page open.
-- **Category filter pills** (loaded from `/api/categories`).
-- **Format filter tabs** (All / Pages / Videos / PDFs / Software).
-- Count selector: 6 / 12 / 24 / 48 links.
-- **Shuffle** button (or press `Space`) to reshuffle.
-- Cards show thumbnail, title, description, domain, category, format badge, like/comment counts.
+---
+
+## CORS
+
+The worker allows requests from:
+- `https://enwek.com`
+- Any `*.enwek.com` subdomain
+- `http://localhost:*` and `http://127.0.0.1:*` (dev)
+- The value of `ALLOWED_ORIGIN` in `wrangler.toml`
+
+Update `ALLOWED_ORIGIN` for staging environments.

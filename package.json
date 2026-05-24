@@ -1,0 +1,18 @@
+{
+  "name": "enwek-worker",
+  "version": "1.0.0",
+  "description": "Enwek Cloudflare Worker — links.enwek.com",
+  "main": "src/index.js",
+  "scripts": {
+    "dev":    "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init:users": "wrangler d1 execute enwek-users --file=schema.sql",
+    "db:init:links": "wrangler d1 execute enwek-links --file=schema.sql"
+  },
+  "dependencies": {
+    "hono": "^4.3.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.57.0"
+  }
+}
