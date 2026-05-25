@@ -160,7 +160,7 @@ router.post('/', async (c) => {
       thumbnail_url || '',
       format,
       body.category_id  || null,
-      body.submitted_by || null
+      body.submitted_by || 'enwek_team_official_xx'
     ).run();
 
     const inserted = await DB.prepare(`SELECT * FROM links WHERE id = ?`).bind(id).first();
@@ -241,7 +241,7 @@ router.post('/bulk', async (c) => {
         thumbnail_url,
         item.format && VALID_FORMATS.has(item.format) ? item.format : 'page',
         item.category_id  || null,
-        item.submitted_by || null
+        item.submitted_by || 'enwek_team_official_xx'
       ).run();
 
       results.push({ url: rawUrl, id, duplicate: false });
