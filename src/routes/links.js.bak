@@ -5,11 +5,20 @@ import { fetchMetadata } from '../lib/metadata.js';
 
 const router = new Hono();
 
+// ─────────────────────────────────────────────────────────────
+//  VALID FORMATS  (matches cont.html options)
+// ─────────────────────────────────────────────────────────────
 const VALID_FORMATS = new Set(['page', 'video', 'pdf', 'software', 'other']);
 
 
 // ─────────────────────────────────────────────────────────────
 //  GET /api/links/random
+//  Used by fetch.html — returns a random batch of links.
+//
+//  Query params:
+//    count    — number of links (default 12, max 48)
+//    category — category slug to filter (optional)
+//    format   — page|video|pdf|software|other (optional)
 // ─────────────────────────────────────────────────────────────
 router.get('/random', async (c) => {
   const DB = c.env.LINKS_DB;
@@ -21,21 +30,30 @@ router.get('/random', async (c) => {
   const conditions = ['l.is_active = 1'];
   const params     = [];
 
-  if (category) { conditions.push(`cat.slug = ?`); params.push(category); }
-  if (format && VALID_FORMATS.has(format)) { conditions.push(`l.format = ?`); params.push(format); }
+  if (category) {
+    conditions.push(`cat.slug = ?`);
+    params.push(category);
+  }
+  if (format && VALID_FORMATS.has(format)) {
+    conditions.push(`l.format = ?`);
+    params.push(format);
+  }
+
+  const where = conditions.join(' AND ');
 
   try {
+    // RANDOM() in SQLite — fast enough for D1 at this scale
     const { results } = await DB.prepare(`
       SELECT
         l.id, l.url, l.title, l.description, l.thumbnail_url,
         l.format, l.domain,
         l.like_count, l.comment_count, l.save_count, l.click_count,
         l.score, l.first_seen_at,
-        cat.name AS category_name,
-        cat.slug AS category_slug
+        cat.name  AS category_name,
+        cat.slug  AS category_slug
       FROM  links l
       LEFT  JOIN categories cat ON cat.id = l.category_id
-      WHERE ${conditions.join(' AND ')}
+      WHERE ${where}
       ORDER BY RANDOM()
       LIMIT ?
     `).bind(...params, count).all();
@@ -50,7 +68,15 @@ router.get('/random', async (c) => {
 
 
 // ─────────────────────────────────────────────────────────────
-//  GET /api/links  (paginated feed)
+//  GET /api/links
+//  Paginated feed  (sort=hot|new|top)
+//
+//  Query params:
+//    page     — page number (default 1)
+//    limit    — per page (default 12, max 48)
+//    sort     — hot | new | top  (default hot)
+//    category — slug (optional)
+//    format   — format type (optional)
 // ─────────────────────────────────────────────────────────────
 router.get('/', async (c) => {
   const DB = c.env.LINKS_DB;
@@ -65,7 +91,7 @@ router.get('/', async (c) => {
   const orderCol =
     sort === 'new' ? 'l.first_seen_at DESC' :
     sort === 'top' ? 'l.like_count DESC'    :
-                     'l.score DESC';
+                     'l.score DESC';          // hot (default)
 
   const conditions = ['l.is_active = 1'];
   const params     = [];
@@ -99,15 +125,55 @@ router.get('/', async (c) => {
 
 
 // ─────────────────────────────────────────────────────────────
-//  POST /api/links  (single insert)
+//  GET /api/links/:id
+//  Single link detail
+// ─────────────────────────────────────────────────────────────
+router.get('/:id', async (c) => {
+  const DB = c.env.LINKS_DB;
+  const id = c.req.param('id');
+
+  try {
+    const link = await DB.prepare(`
+      SELECT l.*, cat.name AS category_name, cat.slug AS category_slug
+      FROM   links l
+      LEFT   JOIN categories cat ON cat.id = l.category_id
+      WHERE  l.id = ? AND l.is_active = 1
+    `).bind(id).first();
+
+    if (!link) return c.json({ error: 'Not found' }, 404);
+    return c.json(link);
+
+  } catch (err) {
+    console.error('links/:id GET:', err);
+    return c.json({ error: 'Failed to fetch link' }, 500);
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/links
+//  Single link insert — used by upload.html (single mode)
+//
+//  Body (JSON):
+//    url         — required
+//    category_id — optional
+//    title       — optional (auto-fetched if empty)
+//    description — optional
+//    thumbnail   — optional
+//    format      — page|video|pdf|software|other (default: page)
+//    submitted_by — optional user id
 // ─────────────────────────────────────────────────────────────
 router.post('/', async (c) => {
   const DB   = c.env.LINKS_DB;
   const body = await c.req.json().catch(() => null);
 
-  if (!body?.url) return c.json({ error: 'url is required' }, 400);
+  if (!body?.url) {
+    return c.json({ error: 'url is required' }, 400);
+  }
 
   const rawUrl = body.url.trim();
+
+  // Validate URL
   try { new URL(rawUrl); } catch {
     return c.json({ error: 'Invalid URL' }, 400);
   }
@@ -116,7 +182,7 @@ router.post('/', async (c) => {
   const domain  = extractDomain(rawUrl);
   const format  = VALID_FORMATS.has(body.format) ? body.format : 'page';
 
-  // Deduplication
+  // ── Deduplication check ──────────────────────────────────────
   const existing = await DB.prepare(
     `SELECT id, title, format, like_count, comment_count, score FROM links WHERE url_hash = ?`
   ).bind(urlHash).first();
@@ -125,18 +191,15 @@ router.post('/', async (c) => {
     return c.json({ success: true, duplicate: true, id: existing.id, link: existing });
   }
 
-  // BUG 2 FIX — upload.html sends body.thumbnail but worker destructured as body.thumbnail_url
-  // Correctly read whichever field is present
-  let title         = body.title        || '';
-  let description   = body.description  || '';
-  let thumbnail_url = body.thumbnail_url || body.thumbnail || '';
+  // ── Auto-fetch metadata if title is missing ──────────────────
+  let { title = '', description = '', thumbnail: thumbnail_url = '' } = body;
 
   if (!title) {
     try {
       const meta = await fetchMetadata(rawUrl);
-      title         = meta.title       || rawUrl;
-      description   = description || meta.description || '';
-      thumbnail_url = thumbnail_url   || meta.thumbnail  || '';
+      title        = meta.title       || rawUrl;
+      description  = description || meta.description || '';
+      thumbnail_url = thumbnail_url  || meta.thumbnail  || '';
     } catch {
       title = rawUrl;
     }
@@ -159,7 +222,7 @@ router.post('/', async (c) => {
       description || '',
       thumbnail_url || '',
       format,
-      body.category_id  || null,
+      body.category_id || null,
       body.submitted_by || null
     ).run();
 
@@ -175,10 +238,15 @@ router.post('/', async (c) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/links/bulk
-//  BUG 1 FIX — must be registered BEFORE /:id routes
-//  otherwise Hono matches "bulk" as an :id parameter
+//  Bulk insert — used by upload.html (bulk mode)
+//  Requires  X-Admin-Secret  header matching ADMIN_SECRET env var.
+//
+//  Body (JSON):
+//    links — array of { url, category_id? }
+//    Max 100 per request (upload.html chunks automatically)
 // ─────────────────────────────────────────────────────────────
 router.post('/bulk', async (c) => {
+  // ── Auth ────────────────────────────────────────────────────
   const secret = c.req.header('X-Admin-Secret');
   if (!secret || secret !== c.env.ADMIN_SECRET) {
     return c.json({ error: 'Unauthorized — invalid or missing Admin Secret' }, 401);
@@ -191,21 +259,26 @@ router.post('/bulk', async (c) => {
     return c.json({ error: 'links array is required and must not be empty' }, 400);
   }
 
-  const batch   = body.links.slice(0, 100);
+  const batch = body.links.slice(0, 100); // hard cap
   const results = [];
 
   for (const item of batch) {
     const rawUrl = (item.url || '').trim();
-    if (!rawUrl) { results.push({ url: '', error: 'empty url', duplicate: false }); continue; }
+    if (!rawUrl) {
+      results.push({ url: '', error: 'empty url', duplicate: false });
+      continue;
+    }
 
     try { new URL(rawUrl); } catch {
-      results.push({ url: rawUrl, error: 'invalid url', duplicate: false }); continue;
+      results.push({ url: rawUrl, error: 'invalid url', duplicate: false });
+      continue;
     }
 
     try {
       const urlHash = await hashURL(rawUrl);
       const domain  = extractDomain(rawUrl);
 
+      // Check duplicate
       const existing = await DB.prepare(
         `SELECT id FROM links WHERE url_hash = ?`
       ).bind(urlHash).first();
@@ -215,6 +288,7 @@ router.post('/bulk', async (c) => {
         continue;
       }
 
+      // Fetch metadata quietly — don't let one slow site block the batch
       let title = '', description = '', thumbnail_url = '';
       try {
         const meta = await fetchMetadata(rawUrl);
@@ -240,7 +314,7 @@ router.post('/bulk', async (c) => {
         description,
         thumbnail_url,
         item.format && VALID_FORMATS.has(item.format) ? item.format : 'page',
-        item.category_id  || null,
+        item.category_id || null,
         item.submitted_by || null
       ).run();
 
@@ -252,61 +326,27 @@ router.post('/bulk', async (c) => {
     }
   }
 
-  return c.json({
-    results,
-    inserted:   results.filter(r => !r.duplicate && !r.error).length,
-    duplicates: results.filter(r =>  r.duplicate).length,
-    errors:     results.filter(r =>  r.error).length,
-  });
-});
+  const inserted   = results.filter(r => !r.duplicate && !r.error).length;
+  const duplicates = results.filter(r =>  r.duplicate).length;
+  const errors     = results.filter(r =>  r.error).length;
 
-
-// ─────────────────────────────────────────────────────────────
-//  GET /api/links/:id  — single link detail
-//  BUG 1 FIX — kept AFTER all static POST routes
-// ─────────────────────────────────────────────────────────────
-router.get('/:id', async (c) => {
-  const DB = c.env.LINKS_DB;
-  const id = c.req.param('id');
-
-  try {
-    const link = await DB.prepare(`
-      SELECT l.*, cat.name AS category_name, cat.slug AS category_slug
-      FROM   links l
-      LEFT   JOIN categories cat ON cat.id = l.category_id
-      WHERE  l.id = ? AND l.is_active = 1
-    `).bind(id).first();
-
-    if (!link) return c.json({ error: 'Not found' }, 404);
-    return c.json(link);
-
-  } catch (err) {
-    console.error('links/:id GET:', err);
-    return c.json({ error: 'Failed to fetch link' }, 500);
-  }
+  return c.json({ results, inserted, duplicates, errors });
 });
 
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/links/:id/click
+//  Record a click event (anonymous is fine)
 // ─────────────────────────────────────────────────────────────
 router.post('/:id/click', async (c) => {
   const DB   = c.env.LINKS_DB;
   const id   = c.req.param('id');
   const body = await c.req.json().catch(() => ({}));
 
-  // BUG 3 FIX — schema has ip_hash column, include it from CF header
-  const ipRaw  = c.req.header('cf-connecting-ip') || '';
-  let   ipHash = '';
-  if (ipRaw) {
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ipRaw));
-    ipHash = Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2,'0')).join('');
-  }
-
   try {
-    await DB.prepare(
-      `INSERT INTO clicks (link_id, user_id, ip_hash) VALUES (?, ?, ?)`
-    ).bind(id, body.user_id || null, ipHash || null).run();
+    await DB.prepare(`
+      INSERT INTO clicks (link_id, user_id) VALUES (?, ?)
+    `).bind(id, body.user_id || null).run();
 
     return c.json({ ok: true });
   } catch (err) {
@@ -317,7 +357,8 @@ router.post('/:id/click', async (c) => {
 
 
 // ─────────────────────────────────────────────────────────────
-//  POST /api/links/:id/like  (toggle)
+//  POST /api/links/:id/like   (toggle)
+//  POST /api/links/:id/save   (toggle)
 // ─────────────────────────────────────────────────────────────
 router.post('/:id/like', async (c) => {
   const DB   = c.env.LINKS_DB;
@@ -349,10 +390,6 @@ router.post('/:id/like', async (c) => {
   }
 });
 
-
-// ─────────────────────────────────────────────────────────────
-//  POST /api/links/:id/save  (toggle)
-// ─────────────────────────────────────────────────────────────
 router.post('/:id/save', async (c) => {
   const DB   = c.env.LINKS_DB;
   const id   = c.req.param('id');
